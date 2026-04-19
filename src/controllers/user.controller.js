@@ -4,6 +4,7 @@ import bcrypt, { hash } from "bcrypt"
 
 import crypto from "crypto"
 import { Meeting } from "../models/meeting.model.js";
+import { Group } from "../models/group.model.js";
 import mongoose from "mongoose";
 
 const messageSchema = new mongoose.Schema(
@@ -23,6 +24,15 @@ const messageSchema = new mongoose.Schema(
 );
 
 const Message = mongoose.models.Message || mongoose.model("Message", messageSchema);
+
+const toPublicUser = (u) => ({
+    _id: u._id,
+    name: u.name,
+    username: u.username,
+    bio: u.bio || "",
+    avatarUrl: u.avatarUrl || "",
+    isOnline: false,
+});
 
 const getTokenFromRequest = (req) => {
     const authHeader = req.headers.authorization || "";
@@ -115,7 +125,7 @@ const getAllConversations = async (req, res) => {
             { name: 1, username: 1, bio: 1, avatarUrl: 1 }
         ).lean();
 
-        const conversations = await Promise.all(
+        const dmConversations = await Promise.all(
             users.map(async (peer) => {
                 const lastMessage = await Message.findOne({
                     $or: [
@@ -131,21 +141,8 @@ const getAllConversations = async (req, res) => {
                     _id: `dm-${peer._id}`,
                     isGroup: false,
                     participants: [
-                        {
-                            _id: currentUser._id,
-                            name: currentUser.name,
-                            username: currentUser.username,
-                            bio: currentUser.bio || "",
-                            avatarUrl: currentUser.avatarUrl || ""
-                        },
-                        {
-                            _id: peer._id,
-                            name: peer.name,
-                            username: peer.username,
-                            bio: peer.bio || "",
-                            avatarUrl: peer.avatarUrl || "",
-                            isOnline: false
-                        }
+                        toPublicUser(currentUser),
+                        toPublicUser(peer)
                     ],
                     lastMessage: lastMessage
                         ? {
@@ -165,6 +162,21 @@ const getAllConversations = async (req, res) => {
             })
         );
 
+        const groups = await Group.find({ members: currentUser._id })
+            .populate("members", "_id name username bio avatarUrl")
+            .lean();
+
+        const groupConversations = groups.map((group) => ({
+            _id: `grp-${group._id}`,
+            name: group.name,
+            isGroup: true,
+            participants: (group.members || []).map(toPublicUser),
+            lastMessage: null,
+            unreadCount: 0,
+            updatedAt: group.updatedAt || group.createdAt,
+        }));
+
+        const conversations = [...dmConversations, ...groupConversations];
         conversations.sort((a, b) => new Date(b.updatedAt || 0) - new Date(a.updatedAt || 0));
         return res.status(httpStatus.OK).json(conversations);
     } catch (e) {
@@ -179,7 +191,32 @@ const getConversationById = async (req, res) => {
             return res.status(httpStatus.UNAUTHORIZED).json({ message: "Unauthorized" });
         }
 
-        const peerId = (req.params.id || "").replace("dm-", "");
+        const rawConversationId = String(req.params.id || "");
+        if (rawConversationId.startsWith("grp-")) {
+            const groupId = rawConversationId.replace("grp-", "");
+            if (!mongoose.Types.ObjectId.isValid(groupId)) {
+                return res.status(httpStatus.BAD_REQUEST).json({ message: "Invalid conversation id" });
+            }
+
+            const group = await Group.findOne({ _id: groupId, members: currentUser._id })
+                .populate("members", "_id name username bio avatarUrl")
+                .lean();
+
+            if (!group) {
+                return res.status(httpStatus.NOT_FOUND).json({ message: "Conversation not found" });
+            }
+
+            return res.status(httpStatus.OK).json({
+                _id: `grp-${group._id}`,
+                name: group.name,
+                isGroup: true,
+                participants: (group.members || []).map(toPublicUser),
+                lastMessage: null,
+                unreadCount: 0,
+            });
+        }
+
+        const peerId = rawConversationId.replace("dm-", "");
         if (!mongoose.Types.ObjectId.isValid(peerId)) {
             return res.status(httpStatus.BAD_REQUEST).json({ message: "Invalid conversation id" });
         }
@@ -203,21 +240,8 @@ const getConversationById = async (req, res) => {
             _id: `dm-${peer._id}`,
             isGroup: false,
             participants: [
-                {
-                    _id: currentUser._id,
-                    name: currentUser.name,
-                    username: currentUser.username,
-                    bio: currentUser.bio || "",
-                    avatarUrl: currentUser.avatarUrl || ""
-                },
-                {
-                    _id: peer._id,
-                    name: peer.name,
-                    username: peer.username,
-                    bio: peer.bio || "",
-                    avatarUrl: peer.avatarUrl || "",
-                    isOnline: false
-                }
+                toPublicUser(currentUser),
+                toPublicUser(peer)
             ],
             lastMessage: lastMessage
                 ? {
@@ -245,7 +269,50 @@ const createConversation = async (req, res) => {
             return res.status(httpStatus.UNAUTHORIZED).json({ message: "Unauthorized" });
         }
 
-        const { recipientId } = req.body;
+        const { recipientId, isGroup, name, participantIds } = req.body;
+
+        if (isGroup) {
+            const normalizedName = String(name || "").trim();
+            const rawParticipants = Array.isArray(participantIds) ? participantIds : [];
+
+            const normalizedIds = [...new Set([
+                ...rawParticipants.map((id) => String(id || "").trim()).filter(Boolean),
+                String(currentUser._id)
+            ])];
+
+            const allIdsValid = normalizedIds.every((id) => mongoose.Types.ObjectId.isValid(id));
+            if (!normalizedName) {
+                return res.status(httpStatus.BAD_REQUEST).json({ message: "Group name is required" });
+            }
+            if (!allIdsValid || normalizedIds.length < 3) {
+                return res.status(httpStatus.BAD_REQUEST).json({ message: "At least 3 valid members are required for a group" });
+            }
+
+            const members = await User.find(
+                { _id: { $in: normalizedIds } },
+                { _id: 1, name: 1, username: 1, bio: 1, avatarUrl: 1 }
+            ).lean();
+
+            if (members.length !== normalizedIds.length) {
+                return res.status(httpStatus.BAD_REQUEST).json({ message: "Some selected users were not found" });
+            }
+
+            const createdGroup = await Group.create({
+                name: normalizedName,
+                members: normalizedIds,
+                createdBy: currentUser._id,
+            });
+
+            return res.status(httpStatus.CREATED).json({
+                _id: `grp-${createdGroup._id}`,
+                name: createdGroup.name,
+                isGroup: true,
+                participants: members.map(toPublicUser),
+                unreadCount: 0,
+                lastMessage: null,
+            });
+        }
+
         if (!recipientId || !mongoose.Types.ObjectId.isValid(recipientId)) {
             return res.status(httpStatus.BAD_REQUEST).json({ message: "Invalid recipient id" });
         }
@@ -259,21 +326,8 @@ const createConversation = async (req, res) => {
             _id: `dm-${peer._id}`,
             isGroup: false,
             participants: [
-                {
-                    _id: currentUser._id,
-                    name: currentUser.name,
-                    username: currentUser.username,
-                    bio: currentUser.bio || "",
-                    avatarUrl: currentUser.avatarUrl || ""
-                },
-                {
-                    _id: peer._id,
-                    name: peer.name,
-                    username: peer.username,
-                    bio: peer.bio || "",
-                    avatarUrl: peer.avatarUrl || "",
-                    isOnline: false
-                }
+                toPublicUser(currentUser),
+                toPublicUser(peer)
             ],
             unreadCount: 0,
             lastMessage: null,
