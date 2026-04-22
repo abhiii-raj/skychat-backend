@@ -9,6 +9,16 @@ let socketToUser = {}
 let callSessions = {}
 let callTimeouts = {}
 
+const normalizeUserId = (userId) => String(userId || "").trim();
+
+const isUserOnlineInternal = (userId) => {
+    const normalizedUserId = normalizeUserId(userId);
+    if (!normalizedUserId) return false;
+    return Array.isArray(userSockets[normalizedUserId]) && userSockets[normalizedUserId].length > 0;
+};
+
+export const isUserOnline = (userId) => isUserOnlineInternal(userId);
+
 const RING_TIMEOUT_MS = 30000;
 
 const makeCallId = () => `call-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
@@ -49,8 +59,10 @@ export const connectToSocket = (server) => {
         console.log("SOMETHING CONNECTED")
 
         socket.on("register-user", (userId) => {
-            const normalizedUserId = String(userId || "").trim();
+            const normalizedUserId = normalizeUserId(userId);
             if (!normalizedUserId) return;
+
+            const wasOnline = isUserOnlineInternal(normalizedUserId);
 
             socketToUser[socket.id] = normalizedUserId;
             if (!userSockets[normalizedUserId]) {
@@ -62,6 +74,10 @@ export const connectToSocket = (server) => {
             }
 
             socket.join(`user:${normalizedUserId}`);
+
+            if (!wasOnline) {
+                io.emit("user_presence_update", { userId: normalizedUserId, isOnline: true });
+            }
         });
 
         socket.on("place_call", (payload = {}) => {
@@ -345,6 +361,34 @@ export const connectToSocket = (server) => {
 
         })
 
+        socket.on("typing", (payload = {}) => {
+            const fromUserId = normalizeUserId(payload.fromUserId || socketToUser[socket.id]);
+            const toUserId = normalizeUserId(payload.toUserId);
+            const senderName = String(payload.senderName || "").trim();
+
+            if (!fromUserId || !toUserId) return;
+
+            io.to(`user:${toUserId}`).emit("typing", {
+                conversationId: `dm-${fromUserId}`,
+                senderName,
+                fromUserId,
+                toUserId,
+            });
+        });
+
+        socket.on("stop_typing", (payload = {}) => {
+            const fromUserId = normalizeUserId(payload.fromUserId || socketToUser[socket.id]);
+            const toUserId = normalizeUserId(payload.toUserId);
+
+            if (!fromUserId || !toUserId) return;
+
+            io.to(`user:${toUserId}`).emit("stop_typing", {
+                conversationId: `dm-${fromUserId}`,
+                fromUserId,
+                toUserId,
+            });
+        });
+
         socket.on("disconnect", () => {
             const disconnectedUserId = socketToUser[socket.id];
 
@@ -352,6 +396,7 @@ export const connectToSocket = (server) => {
                 userSockets[disconnectedUserId] = userSockets[disconnectedUserId].filter((id) => id !== socket.id);
                 if (userSockets[disconnectedUserId].length === 0) {
                     delete userSockets[disconnectedUserId];
+                    io.emit("user_presence_update", { userId: disconnectedUserId, isOnline: false });
                 }
             }
 

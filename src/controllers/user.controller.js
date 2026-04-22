@@ -6,6 +6,7 @@ import crypto from "crypto"
 import { Meeting } from "../models/meeting.model.js";
 import { Group } from "../models/group.model.js";
 import mongoose from "mongoose";
+import { isUserOnline } from "./socketManager.js";
 
 const messageSchema = new mongoose.Schema(
     {
@@ -31,7 +32,7 @@ const toPublicUser = (u) => ({
     username: u.username,
     bio: u.bio || "",
     avatarUrl: u.avatarUrl || "",
-    isOnline: false,
+    isOnline: isUserOnline(u?._id),
 });
 
 const getTokenFromRequest = (req) => {
@@ -104,7 +105,7 @@ const getAllUsers = async (req, res) => {
                 username: u.username,
                 bio: u.bio || "",
                 avatarUrl: u.avatarUrl || "",
-                isOnline: false
+                isOnline: isUserOnline(u?._id)
             }));
 
         return res.status(httpStatus.OK).json(filteredUsers);
