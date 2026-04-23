@@ -9,7 +9,8 @@ const userScheme = new Schema(
         resetToken: { type: String },
         resetTokenExpires: { type: Date },
         bio: { type: String, default: "" },
-        avatarUrl: { type: String, default: "" }
+        avatarUrl: { type: String, default: "" },
+        friends: [{ type: Schema.Types.ObjectId, ref: "User", default: [] }]
     }
 )
 

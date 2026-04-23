@@ -8,6 +8,10 @@ import {
 	deleteMessage,
 	getAllConversations,
 	getAllUsers,
+	getContacts,
+	createFriendRequest,
+	acceptFriendRequest,
+	rejectFriendRequest,
 	getConversationById,
 	getConversationMessages,
 	getProfile,
@@ -45,6 +49,10 @@ router.route("/forgot-password").post(requestPasswordReset)
 router.route("/reset-password").post(resetPassword)
 router.route("/profile").get(getProfile).put(upload.single("avatar"), updateProfile)
 router.route("/users").get(getAllUsers)
+router.route("/contacts").get(getContacts)
+router.route("/friends/request").post(createFriendRequest)
+router.route("/friends/accept").post(acceptFriendRequest)
+router.route("/friends/reject").post(rejectFriendRequest)
 router.route("/conversations").get(getAllConversations).post(createConversation)
 router.route("/conversations/:id").get(getConversationById)
 router.route("/messages/:userId").get(getConversationMessages)

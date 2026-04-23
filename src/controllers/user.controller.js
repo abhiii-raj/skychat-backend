@@ -26,6 +26,19 @@ const messageSchema = new mongoose.Schema(
 
 const Message = mongoose.models.Message || mongoose.model("Message", messageSchema);
 
+const friendRequestSchema = new mongoose.Schema(
+    {
+        from: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true },
+        to: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true },
+        status: { type: String, enum: ["pending", "accepted", "rejected"], default: "pending" },
+    },
+    { timestamps: true }
+);
+
+friendRequestSchema.index({ from: 1, to: 1 }, { unique: true });
+
+const FriendRequest = mongoose.models.FriendRequest || mongoose.model("FriendRequest", friendRequestSchema);
+
 const toPublicUser = (u) => ({
     _id: u._id,
     name: u.name,
@@ -47,6 +60,64 @@ const getCurrentUserFromRequest = async (req) => {
     const token = getTokenFromRequest(req);
     if (!token) return null;
     return User.findOne({ token });
+};
+
+const areUsersFriends = async (userIdA, userIdB) => {
+    if (!userIdA || !userIdB) return false;
+    const exists = await User.exists({ _id: userIdA, friends: userIdB });
+    return Boolean(exists);
+};
+
+const getFriendshipMeta = async (currentUser) => {
+    const me = await User.findById(currentUser._id, { friends: 1 }).lean();
+    const friendIdSet = new Set((me?.friends || []).map((id) => String(id)));
+
+    const requests = await FriendRequest.find({
+        status: "pending",
+        $or: [{ from: currentUser._id }, { to: currentUser._id }]
+    }, { from: 1, to: 1 }).lean();
+
+    const sentToMap = new Map();
+    const receivedFromMap = new Map();
+
+    requests.forEach((request) => {
+        const fromId = String(request.from);
+        const toId = String(request.to);
+
+        if (fromId === String(currentUser._id)) {
+            sentToMap.set(toId, String(request._id));
+            return;
+        }
+
+        if (toId === String(currentUser._id)) {
+            receivedFromMap.set(fromId, String(request._id));
+        }
+    });
+
+    return { friendIdSet, sentToMap, receivedFromMap };
+};
+
+const getFriendshipStatusForUser = (userId, friendshipMeta) => {
+    const normalizedUserId = String(userId);
+    if (friendshipMeta.friendIdSet.has(normalizedUserId)) {
+        return { friendshipStatus: "friend", friendRequestId: null };
+    }
+
+    if (friendshipMeta.sentToMap.has(normalizedUserId)) {
+        return {
+            friendshipStatus: "pending_sent",
+            friendRequestId: friendshipMeta.sentToMap.get(normalizedUserId)
+        };
+    }
+
+    if (friendshipMeta.receivedFromMap.has(normalizedUserId)) {
+        return {
+            friendshipStatus: "pending_received",
+            friendRequestId: friendshipMeta.receivedFromMap.get(normalizedUserId)
+        };
+    }
+
+    return { friendshipStatus: "none", friendRequestId: null };
 };
 
 const login = async (req, res) => {
@@ -94,25 +165,38 @@ const getAllUsers = async (req, res) => {
     try {
         const token = getTokenFromRequest(req);
         const currentUser = token ? await User.findOne({ token }) : null;
+        const friendshipMeta = currentUser ? await getFriendshipMeta(currentUser) : null;
 
         const users = await User.find({}, { name: 1, username: 1, bio: 1, avatarUrl: 1 }).lean();
 
         const filteredUsers = users
             .filter((u) => !currentUser || String(u._id) !== String(currentUser._id))
-            .map((u) => ({
-                _id: u._id,
-                name: u.name,
-                username: u.username,
-                bio: u.bio || "",
-                avatarUrl: u.avatarUrl || "",
-                isOnline: isUserOnline(u?._id)
-            }));
+            .map((u) => {
+                const friendship = friendshipMeta
+                    ? getFriendshipStatusForUser(u._id, friendshipMeta)
+                    : { friendshipStatus: "none", friendRequestId: null };
+
+                return {
+                    _id: u._id,
+                    name: u.name,
+                    username: u.username,
+                    bio: u.bio || "",
+                    avatarUrl: u.avatarUrl || "",
+                    isOnline: isUserOnline(u?._id),
+                    friendshipStatus: friendship.friendshipStatus,
+                    friendRequestId: friendship.friendRequestId,
+                };
+            });
 
         return res.status(httpStatus.OK).json(filteredUsers);
     } catch (e) {
         return res.status(httpStatus.INTERNAL_SERVER_ERROR).json({ message: `Something went wrong ${e}` });
     }
 }
+
+const getContacts = async (req, res) => {
+    return getAllUsers(req, res);
+};
 
 const getAllConversations = async (req, res) => {
     try {
@@ -121,8 +205,11 @@ const getAllConversations = async (req, res) => {
             return res.status(httpStatus.UNAUTHORIZED).json({ message: "Unauthorized" });
         }
 
+        const me = await User.findById(currentUser._id, { friends: 1 }).lean();
+        const friendIds = me?.friends || [];
+
         const users = await User.find(
-            { _id: { $ne: currentUser._id } },
+            { _id: { $in: friendIds } },
             { name: 1, username: 1, bio: 1, avatarUrl: 1 }
         ).lean();
 
@@ -227,6 +314,11 @@ const getConversationById = async (req, res) => {
             return res.status(httpStatus.NOT_FOUND).json({ message: "Conversation not found" });
         }
 
+        const isFriend = await areUsersFriends(currentUser._id, peer._id);
+        if (!isFriend) {
+            return res.status(httpStatus.FORBIDDEN).json({ message: "Add this user as a friend to start chatting" });
+        }
+
         const lastMessage = await Message.findOne({
             $or: [
                 { sender: currentUser._id, recipient: peer._id },
@@ -323,6 +415,11 @@ const createConversation = async (req, res) => {
             return res.status(httpStatus.NOT_FOUND).json({ message: "Recipient not found" });
         }
 
+        const isFriend = await areUsersFriends(currentUser._id, peer._id);
+        if (!isFriend) {
+            return res.status(httpStatus.FORBIDDEN).json({ message: "Add this user as a friend to start chatting" });
+        }
+
         return res.status(httpStatus.CREATED).json({
             _id: `dm-${peer._id}`,
             isGroup: false,
@@ -348,6 +445,11 @@ const getConversationMessages = async (req, res) => {
         const peerId = req.params.userId;
         if (!peerId || !mongoose.Types.ObjectId.isValid(peerId)) {
             return res.status(httpStatus.BAD_REQUEST).json({ message: "Invalid user id" });
+        }
+
+        const isFriend = await areUsersFriends(currentUser._id, peerId);
+        if (!isFriend) {
+            return res.status(httpStatus.FORBIDDEN).json({ message: "Add this user as a friend to start chatting" });
         }
 
         const page = Math.max(1, parseInt(req.query.page || "1", 10));
@@ -403,6 +505,11 @@ const sendMessage = async (req, res) => {
         const peer = await User.findById(recipientId);
         if (!peer) {
             return res.status(httpStatus.NOT_FOUND).json({ message: "Recipient not found" });
+        }
+
+        const isFriend = await areUsersFriends(currentUser._id, recipientId);
+        if (!isFriend) {
+            return res.status(httpStatus.FORBIDDEN).json({ message: "Add this user as a friend to start chatting" });
         }
 
         const fileUrl = uploadedFile
@@ -584,12 +691,148 @@ const updateProfile = async (req, res) => {
     }
 }
 
+const createFriendRequest = async (req, res) => {
+    try {
+        const currentUser = await getCurrentUserFromRequest(req);
+        if (!currentUser) {
+            return res.status(httpStatus.UNAUTHORIZED).json({ message: "Unauthorized" });
+        }
+
+        const targetUserId = String(req.body.userId || "").trim();
+        if (!targetUserId || !mongoose.Types.ObjectId.isValid(targetUserId)) {
+            return res.status(httpStatus.BAD_REQUEST).json({ message: "Invalid user id" });
+        }
+
+        if (String(currentUser._id) === targetUserId) {
+            return res.status(httpStatus.BAD_REQUEST).json({ message: "You cannot send a friend request to yourself" });
+        }
+
+        const targetUser = await User.findById(targetUserId, { _id: 1 }).lean();
+        if (!targetUser) {
+            return res.status(httpStatus.NOT_FOUND).json({ message: "User not found" });
+        }
+
+        const isFriend = await areUsersFriends(currentUser._id, targetUserId);
+        if (isFriend) {
+            return res.status(httpStatus.CONFLICT).json({ message: "User is already your friend" });
+        }
+
+        const incomingPending = await FriendRequest.findOne({
+            from: targetUserId,
+            to: currentUser._id,
+            status: "pending"
+        }).lean();
+
+        if (incomingPending) {
+            return res.status(httpStatus.CONFLICT).json({ message: "This user already sent you a friend request" });
+        }
+
+        let outgoingRequest = await FriendRequest.findOne({ from: currentUser._id, to: targetUserId });
+
+        if (outgoingRequest?.status === "pending") {
+            return res.status(httpStatus.OK).json({
+                message: "Friend request already sent",
+                requestId: outgoingRequest._id,
+                status: outgoingRequest.status,
+            });
+        }
+
+        if (!outgoingRequest) {
+            outgoingRequest = await FriendRequest.create({
+                from: currentUser._id,
+                to: targetUserId,
+                status: "pending",
+            });
+        } else {
+            outgoingRequest.status = "pending";
+            await outgoingRequest.save();
+        }
+
+        return res.status(httpStatus.CREATED).json({
+            message: "Friend request sent",
+            requestId: outgoingRequest._id,
+            status: outgoingRequest.status,
+        });
+    } catch (e) {
+        return res.status(httpStatus.INTERNAL_SERVER_ERROR).json({ message: `Something went wrong ${e}` });
+    }
+};
+
+const acceptFriendRequest = async (req, res) => {
+    try {
+        const currentUser = await getCurrentUserFromRequest(req);
+        if (!currentUser) {
+            return res.status(httpStatus.UNAUTHORIZED).json({ message: "Unauthorized" });
+        }
+
+        const fromUserId = String(req.body.userId || "").trim();
+        if (!fromUserId || !mongoose.Types.ObjectId.isValid(fromUserId)) {
+            return res.status(httpStatus.BAD_REQUEST).json({ message: "Invalid user id" });
+        }
+
+        const request = await FriendRequest.findOne({
+            from: fromUserId,
+            to: currentUser._id,
+            status: "pending"
+        });
+
+        if (!request) {
+            return res.status(httpStatus.NOT_FOUND).json({ message: "Friend request not found" });
+        }
+
+        request.status = "accepted";
+        await request.save();
+
+        await User.updateOne({ _id: currentUser._id }, { $addToSet: { friends: fromUserId } });
+        await User.updateOne({ _id: fromUserId }, { $addToSet: { friends: currentUser._id } });
+
+        return res.status(httpStatus.OK).json({ message: "Friend request accepted" });
+    } catch (e) {
+        return res.status(httpStatus.INTERNAL_SERVER_ERROR).json({ message: `Something went wrong ${e}` });
+    }
+};
+
+const rejectFriendRequest = async (req, res) => {
+    try {
+        const currentUser = await getCurrentUserFromRequest(req);
+        if (!currentUser) {
+            return res.status(httpStatus.UNAUTHORIZED).json({ message: "Unauthorized" });
+        }
+
+        const fromUserId = String(req.body.userId || "").trim();
+        if (!fromUserId || !mongoose.Types.ObjectId.isValid(fromUserId)) {
+            return res.status(httpStatus.BAD_REQUEST).json({ message: "Invalid user id" });
+        }
+
+        const request = await FriendRequest.findOne({
+            from: fromUserId,
+            to: currentUser._id,
+            status: "pending"
+        });
+
+        if (!request) {
+            return res.status(httpStatus.NOT_FOUND).json({ message: "Friend request not found" });
+        }
+
+        request.status = "rejected";
+        await request.save();
+
+        return res.status(httpStatus.OK).json({ message: "Friend request rejected" });
+    } catch (e) {
+        return res.status(httpStatus.INTERNAL_SERVER_ERROR).json({ message: `Something went wrong ${e}` });
+    }
+};
+
 export {
     login,
     register,
     getUserHistory,
     addToHistory,
     getAllUsers,
+    getContacts,
+    createFriendRequest,
+    acceptFriendRequest,
+    rejectFriendRequest,
     getAllConversations,
     getConversationById,
     createConversation,
